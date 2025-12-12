@@ -52,7 +52,6 @@ lib/
 
 ## Notes
 
-- All data is hardcoded (no backend connection)
 - Ready for immediate demo recording
 - Smooth animations and transitions throughout
 
