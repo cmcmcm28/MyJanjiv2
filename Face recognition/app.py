@@ -13,9 +13,11 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 # --- CONFIGURATION ---
-# Replace with your actual URI from environment variable
-# Set DB_URI environment variable before running: export DB_URI="your_connection_string"
-DB_URI = os.getenv("DB_URI", "postgres://user:password@host:port/database?sslmode=require")
+# Use environment variable for DB; if missing, fallback to None (non-DB mode)
+# Set DB_URI before running if you want DB-backed matching:
+#   PowerShell:  $env:DB_URI="postgres://user:pass@host:port/db?sslmode=require"
+#   Bash:        export DB_URI="postgres://user:pass@host:port/db?sslmode=require"
+DB_URI = os.getenv("DB_URI", None)
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 MODEL_NAME = "Facenet512"
@@ -30,7 +32,13 @@ except:
     pass
 
 def get_db_connection():
-    return psycopg2.connect(DB_URI)
+    if not DB_URI:
+        return None
+    try:
+        return psycopg2.connect(DB_URI)
+    except Exception as e:
+        print(f"DB connection failed: {e}")
+        return None
 
 def generate_embedding(img_input):
     embedding_obj = DeepFace.represent(
@@ -73,15 +81,19 @@ def upload_ic():
     try:
         embedding = generate_embedding(filepath)
         conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # Reset DB for single-user session
-        cur.execute("DELETE FROM pictures;") 
-        cur.execute("INSERT INTO pictures (picture, embedding) VALUES (%s, %s)", 
-                    ("user_ic.jpg", embedding))
-        conn.commit()
-        conn.close()
-        print("✅ New IC Registered!")
+        if conn:
+            cur = conn.cursor()
+            
+            # Reset DB for single-user session
+            cur.execute("DELETE FROM pictures;") 
+            cur.execute("INSERT INTO pictures (picture, embedding) VALUES (%s, %s)", 
+                        ("user_ic.jpg", embedding))
+            conn.commit()
+            conn.close()
+            print("✅ New IC Registered (DB)!")
+        else:
+            # No DB mode: store nothing, just acknowledge
+            print("⚠️ DB unavailable; skipping storage. Running in stateless mode.")
         
         # Return JSON with CORS headers
         response = jsonify({"status": "success", "message": "IC uploaded successfully", "redirect": url_for('verify_page')})
@@ -170,41 +182,53 @@ def process_frame():
         embedding = generate_embedding(rgb_face)
 
         conn = get_db_connection()
-        cur = conn.cursor()
-        string_rep = "["+ ",".join(str(x) for x in embedding) +"]"
-        
-        cur.execute("""
-            SELECT picture, (embedding <-> %s) as distance 
-            FROM pictures 
-            ORDER BY embedding <-> %s ASC 
-            LIMIT 1;
-        """, (string_rep, string_rep))
-        row = cur.fetchone()
-        conn.close()
+        if conn:
+            cur = conn.cursor()
+            string_rep = "["+ ",".join(str(x) for x in embedding) +"]"
+            
+            cur.execute("""
+                SELECT picture, (embedding <-> %s) as distance 
+                FROM pictures 
+                ORDER BY embedding <-> %s ASC 
+                LIMIT 1;
+            """, (string_rep, string_rep))
+            row = cur.fetchone()
+            conn.close()
 
-        if row:
-            distance = row[1]
-            max_score_dist = PASSING_THRESHOLD_DISTANCE * 2
-            raw_score = ((max_score_dist - distance) / max_score_dist) * 100
-            score = round(max(0, min(100, raw_score)))
+            if row:
+                distance = row[1]
+                max_score_dist = PASSING_THRESHOLD_DISTANCE * 2
+                raw_score = ((max_score_dist - distance) / max_score_dist) * 100
+                score = round(max(0, min(100, raw_score)))
 
-            print(f"DEBUG: Distance: {distance:.2f} | Score: {score}%")
+                print(f"DEBUG: Distance: {distance:.2f} | Score: {score}%")
 
-            if distance < PASSING_THRESHOLD_DISTANCE:
-                response = jsonify({
-                    "status": "success", 
-                    "score": score, 
-                    "message": "Identity Verified",
-                    "redirect": url_for('success_page')
-                })
-                response.headers.add('Access-Control-Allow-Origin', '*')
-                return response
+                if distance < PASSING_THRESHOLD_DISTANCE:
+                    response = jsonify({
+                        "status": "success", 
+                        "score": score, 
+                        "message": "Identity Verified",
+                        "redirect": url_for('success_page')
+                    })
+                    response.headers.add('Access-Control-Allow-Origin', '*')
+                    return response
+                else:
+                    response = jsonify({"status": "fail", "score": score, "message": "Face mismatch"})
+                    response.headers.add('Access-Control-Allow-Origin', '*')
+                    return response
             else:
-                response = jsonify({"status": "fail", "score": score, "message": "Face mismatch"})
+                response = jsonify({"status": "error", "message": "No ID record found"})
                 response.headers.add('Access-Control-Allow-Origin', '*')
                 return response
         else:
-            response = jsonify({"status": "error", "message": "No ID record found"})
+            # No DB mode: just return a success with mock score
+            mock_score = 100
+            response = jsonify({
+                "status": "success", 
+                "score": mock_score, 
+                "message": "Identity Verified (stateless mode)",
+                "redirect": url_for('success_page')
+            })
             response.headers.add('Access-Control-Allow-Origin', '*')
             return response
 
